@@ -5,8 +5,6 @@ import logging
 import struct
 from typing import Deque
 from collections import deque
-import timeout_decorator
-from timeout_decorator import timeout
 from intelhex import IntelHex
 from .IODevices import IODevice, UartDevice
 from .parts_definitions import GetPartDescriptor
@@ -15,7 +13,7 @@ from . import tools
 
 _log = logging.getLogger("isp_programmer")
 
-kTimeout = 1
+kTimeout = 0.1
 
 
 BAUDRATES = (9600, 19200, 38400, 57600, 115200, 230400, 460800)
@@ -145,11 +143,10 @@ class ISPConnection:
     def _flush(self):
         self.iodevice.flush()
 
-    @timeout(kTimeout)
     def _read_line(self) -> str:
         """
         Read until a new line is found.
-        Timesout if no data pulled
+        Times out if no data pulled
         """
         line = self.iodevice.ReadLine()
         return line
@@ -171,39 +168,32 @@ class ISPConnection:
         self.data_buffer_in.extend(data_in)
 
     def _clear_serial(self):
-        for _ in range(2):
-            tools.retry(
-                self._read,
-                count=10,
-                exception=timeout_decorator.TimeoutError,
-                raise_on_fail=False,
-            )()
-            self._clear_buffer()
-            self._flush()
+        self._flush()
+        self._clear_buffer()
 
     def _get_return_code(self, command_string: str) -> int:
         """
-        No exceptions are thrown.
+        No exceptions are thrown. Expects echo to be turned on
         """
         time.sleep(self._return_code_sleep)
-        try:
-            resp = self._read_line()
-            if resp.strip() == command_string.strip():
-                _log.debug(
-                    "Command was echoed, Discarding line: %s", resp
-                )
-                resp = self._read_line()
-            # if self.echo_on:  # discard echo
-            #    _log.debug("ECHO ON, Discarding line: %s", resp)
-            #    resp = self._read_line()
-        except (timeout_decorator.TimeoutError, TimeoutError):
-            self._write(bytes(self.kNewLine, encoding="utf-8"))
-            return self.ReturnCodes["NoStatusResponse"]
+        for _ in range(5):
+            try:
+                resp = self._read_line().strip()
+                _log.debug("Return Code: %s", resp)
+                if resp == command_string.strip():
+                    _log.debug("Command was echoed, Discarding line: %s", resp)
+                    resp = self._read_line().strip()
+                    break
+            except TimeoutError:
+                self._write(bytes(self.kNewLine, encoding="utf-8"))
+                _log.debug("Timedout, Return Code: %s", resp)
+                return self.ReturnCodes["NoStatusResponse"]
+
         if len(resp) == 0:
             return self.ReturnCodes["NoStatusResponse"]
 
         _log.debug("%s: %s", command_string, resp)
-        return int(resp.strip())
+        return int(resp)
 
     def _write(self, string: bytes) -> None:
         _log.debug(string)
@@ -234,9 +224,13 @@ class ISPConnection:
 
     def SetBaudRate(self, baud_rate: int, stop_bits: int = 1):
         """
-        Baud Depends of FAIM config, stopbit is 1 or 2
+        Baud Depends of FAIM config, stopbit is 1 or 2. This can
+        take a few tries to work at bootup.
         """
-        response_code = self._write_command(f"B {baud_rate} {stop_bits}")
+        for _ in range(5):
+            response_code = self._write_command(f"B {baud_rate} {stop_bits}")
+            if response_code == 0:
+                break
         _raise_return_code_error(response_code, "Set Baudrate")
 
     def SetEcho(self, on: bool = True):
@@ -270,7 +264,6 @@ class ISPConnection:
         # if self.SyncVerifiedString.strip() not in response:
         #     _log.error(f"Expected {self.SyncVerifiedString}, received {response}. No confirmation from {function_name}")
 
-    @timeout(10)
     def ReadMemory(self, start: int, num_bytes: int):
         """
         Send command with newline, receive response code\r\n<data>
@@ -286,9 +279,7 @@ class ISPConnection:
         _raise_return_code_error(response_code, function)
 
         while len(self.data_buffer_in) < num_bytes:
-            _log.debug(
-                f"{function}: bytes in {len(self.data_buffer_in)}/{num_bytes}"
-            )
+            _log.debug(f"{function}: bytes in {len(self.data_buffer_in)}/{num_bytes}")
             time.sleep(0.1)
             self._read()
         # Command success is sent at the end of the transferr
@@ -343,12 +334,9 @@ class ISPConnection:
         assert start <= end
         response_code = self._write_command(f"I {start} {end}")
         if response_code == 8:
-            try:
-                response = self._read_line()
-                response = self._read_line()
-                _log.debug(f"Check Sectors Blank response: {response}")
-            except timeout_decorator.TimeoutError:
-                pass
+            response = self._read_line()
+            response = self._read_line()
+            _log.debug(f"Check Sectors Blank response: {response}")
 
         if response_code not in (
             NXPReturnCodes["CMD_SUCCESS"],
@@ -364,12 +352,7 @@ class ISPConnection:
         response_code = self._write_command("J")
         _raise_return_code_error(response_code, "Read Part ID")
 
-        resp = tools.retry(
-            self._read_line,
-            count=1,
-            exception=timeout_decorator.TimeoutError,
-            raise_on_fail=False,
-        )()
+        resp = self._read_line()
         with contextlib.suppress(TypeError):
             return int(resp)
         return 0
@@ -384,11 +367,8 @@ class ISPConnection:
         minor = 0
         major = 0
 
-        try:
-            minor = self._read_line().strip()
-            major = self._read_line().strip()
-        except timeout_decorator.TimeoutError:
-            pass
+        minor = self._read_line().strip()
+        major = self._read_line().strip()
         return f"{major}.{minor}"
 
     def MemoryLocationsEqual(
@@ -409,17 +389,11 @@ class ISPConnection:
 
         if response_code == NXPReturnCodes["COMPARE_ERROR"]:
             # Will return first location of mismatched location if the response is COMPARE_ERROR
-            try:
-                _ = self._read_line()
-                # discard the comparison
-            except timeout_decorator.TimeoutError:
-                pass
+            _ = self._read_line()
+            # discard the comparison
         return _return_code_success(response_code)
 
     def ReadUID(self):
-        """
-        Raises timeout exception
-        """
         response_code = self._write_command("N")
         _raise_return_code_error(response_code, "Read UID")
         uuids = []
@@ -459,13 +433,10 @@ class ISPConnection:
         self._write(bytes(f"{frequency_khz} {self.kNewLine}", encoding="utf-8"))
         verified = False
         for _ in range(3):
-            try:
-                frame_in = self._read_line()  # Should be OK\r\n
-                if self.SyncVerifiedString in frame_in:
-                    verified = True
-                    break
-            except timeout_decorator.TimeoutError:
-                pass
+            frame_in = self._read_line()  # Should be OK\r\n
+            if self.SyncVerifiedString in frame_in:
+                verified = True
+                break
         if not verified:
             raise UserWarning("Verification Failure")
 
@@ -489,15 +460,21 @@ class ISPConnection:
         sync_char = "?"
         # > ?\n
         self._write(bytes(sync_char, "utf-8"))
-        byte_in = self.iodevice.read()
+        byte_in = self.iodevice.read().strip().decode("utf-8")
+        _log.debug("Recieved: %s", byte_in)
+        assert isinstance(byte_in, str)
+        assert isinstance(sync_char, str)
         if byte_in == sync_char:
             # already syncronized
             _log.info("Already synchronized")
+            self._write(bytes("\n", "utf-8"))
+            time.sleep(0.01)
+            self.reset()
             return
 
         try:
             frame_in = self._read_line()
-        except timeout_decorator.TimeoutError:
+        except TimeoutError:
             frame_in = tools.collection_to_string(self._get_data_buffer_contents())
 
         valid_response = self.SyncString.strip()[1:] in frame_in
@@ -521,7 +498,7 @@ class ISPConnection:
         try:
             time.sleep(0.1)
             frame_in = self._read_line()
-        except timeout_decorator.TimeoutError:
+        except TimeoutError:
             frame_in = tools.collection_to_string(self._get_data_buffer_contents())
 
         _log.debug(f"{frame_in}")
@@ -532,7 +509,7 @@ class ISPConnection:
         time.sleep(0.1)
         try:
             frame_in = self._read_line()
-        except timeout_decorator.TimeoutError:
+        except TimeoutError:
             frame_in = tools.collection_to_string(self._get_data_buffer_contents())
 
         _log.debug(f"{frame_in}")
@@ -553,7 +530,7 @@ class ISPConnection:
             _log.debug(frame_in)
             frame_in = self._read_line()
             _log.debug(frame_in)
-        except timeout_decorator.TimeoutError:
+        except TimeoutError:
             pass
 
 
@@ -582,8 +559,8 @@ class ChipDescription:
         self.RAMBufferSize = int(descriptor.pop("RAMBufferSize"))
         self.SectorCount: int = int(descriptor.pop("SectorCount"))
         self.RAMStartWrite: int = int(descriptor.pop("RAMStartWrite"))
-        self.CrystalFrequency = 12000  # khz == 30MHz
-        self.kCheckSumLocation = 7  # 0x0000001c
+        self.CrystalFrequency: int = 12000  # khz == 30MHz
+        self.kCheckSumLocation: int = 7  # 0x0000001c
 
         assert self.RAMRange[0] > 0
         assert self.RAMRange[1] > self.RAMRange[0]

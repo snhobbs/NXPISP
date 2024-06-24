@@ -3,7 +3,6 @@ import logging
 import functools
 import zlib
 from pycrc.algorithms import Crc
-import timeout_decorator
 
 
 def collection_to_string(arr):
@@ -38,9 +37,7 @@ def calc_crc(frame: bytes):
     # return Crc32(frame)
 
 
-def retry(
-    _func=None, *, count=2, exception=timeout_decorator.TimeoutError, raise_on_fail=True
-):
+def retry(_func=None, *, count=2, exception=TimeoutError, raise_on_fail=True):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
